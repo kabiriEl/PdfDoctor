@@ -1,0 +1,39 @@
+.venv/
+.venv/
+# Environments
+venv/
+env/
+.env
+.env.*
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.nox/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local data/logs
+logs/
+*.log
+db/*.db
+db/*.sqlite*
