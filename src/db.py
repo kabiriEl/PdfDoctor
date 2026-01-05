@@ -1,14 +1,8 @@
-"""Gestion de la base de données SQLite.
-
-Crée la table 'papers' si elle n'existe pas, gère les connexions
-avec mode WAL (Write-Ahead Logging) pour la performance, et insère
-les données de chaque document analysé (texte brut, extraits,
-classification, résumés).
-"""
+"""Gestion de la base de données SQLite."""
 from __future__ import annotations
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict
+from typing import Any
 
 
 SCHEMA = """
@@ -31,8 +25,10 @@ CREATE TABLE IF NOT EXISTS papers (
 
 
 def get_conn(db_path: str | Path) -> sqlite3.Connection:
+    """Crée/ouvre la connexion à la BD SQLite."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute(SCHEMA)
@@ -40,10 +36,13 @@ def get_conn(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def insert_paper(conn: sqlite3.Connection, data: Dict[str, Any]) -> int:
+def insert_paper(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
+    """Insère un document dans la BD et retourne son ID."""
     cols = ", ".join(data.keys())
-    qs = ", ".join(["?"] * len(data))
-    cur = conn.cursor()
-    cur.execute(f"INSERT INTO papers ({cols}) VALUES ({qs})", list(data.values()))
+    placeholders = ", ".join(["?"] * len(data))
+    
+    cursor = conn.cursor()
+    cursor.execute(f"INSERT INTO papers ({cols}) VALUES ({placeholders})", list(data.values()))
     conn.commit()
-    return int(cur.lastrowid)
+    
+    return int(cursor.lastrowid)

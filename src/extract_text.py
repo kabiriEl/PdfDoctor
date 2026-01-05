@@ -1,23 +1,20 @@
-"""Extraction du texte brut depuis un fichier PDF.
-
-Utilise PyMuPDF (fitz) pour parcourir toutes les pages du PDF
-et récupérer le texte en format simple, page par page.
-"""
+"""Extraction du texte brut d'un fichier PDF."""
 from __future__ import annotations
 from pathlib import Path
 import fitz
 
 
 def extract_text_from_pdf(pdf_path: str | Path) -> str:
+    """Extrait le texte de toutes les pages d'un PDF."""
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
-        raise FileNotFoundError(pdf_path)
+        raise FileNotFoundError(f"PDF non trouvé : {pdf_path}")
 
-    text_parts: list[str] = []
+    pages = []
     with fitz.open(pdf_path) as doc:
         for page in doc:
-            t = page.get_text("text")
-            if t:
-                text_parts.append(t)
+            text = page.get_text("text")
+            if text.strip():
+                pages.append(text)
 
-    return "\n".join(text_parts).strip()
+    return "\n".join(pages).strip()

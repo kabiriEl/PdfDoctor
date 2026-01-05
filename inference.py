@@ -1,8 +1,11 @@
-"""Script principal pour analyser un PDF scientifique sur les fractures.
+"""Analyse complète d'un PDF scientifique sur les fractures.
 
-Lit un PDF, extrait le texte, récupère l'abstract et la conclusion,
-classifie par mots-clés médicaux (région, type, localisation),
-résume les sections pertinentes, puis enregistre tout dans SQLite.
+Pipeline principal :
+1. Extraction du texte brut du PDF
+2. Extraction des sections (abstract, conclusion)
+3. Classification par mots-clés médicaux
+4. Génération des résumés
+5. Sauvegarde en base de données SQLite
 """
 from __future__ import annotations
 import argparse
@@ -17,105 +20,88 @@ from src.summarize import summarize, clean_extracted_text
 from src.db import get_conn, insert_paper
 
 
-def _fallback_tail(text: str, max_words: int = 200) -> str:
-    """Prend la fin du texte brut pour fabriquer une pseudo-conclusion si rien n'est extrait."""
-    t = (text or "").replace("\r", "\n")
-    parts = [p.strip() for p in t.split("\n\n") if p.strip()]
-    tail = list(reversed(parts))
-    words: list[str] = []
-    for p in tail:
+def _extract_sections(text: str) -> tuple[str, str]:
+    """Extrait abstract et conclusion avec fallback LLM si nécessaire."""
+    abstract, conclusion = extract_abstract_and_conclusion(text)
+    
+    if (not abstract or len(abstract.split()) < 50) or \
+       (not conclusion or len(conclusion.split()) < 30):
+        abs_llm, conc_llm = llm_extract_abstract_conclusion(text)
+        if not abstract or len(abstract.split()) < 50:
+            abstract = abs_llm or abstract
+        if not conclusion or len(conclusion.split()) < 30:
+            conclusion = conc_llm or conclusion
+    
+    return abstract, conclusion
+
+
+def _get_text_tail(text: str, max_words: int = 200) -> str:
+    """Extrait la fin du texte (utilisée comme fallback)."""
+    parts = [p.strip() for p in text.replace("\r", "\n").split("\n\n") if p.strip()]
+    words = []
+    for p in reversed(parts):
         words.extend(p.split())
         if len(words) >= max_words:
             break
-    words = list(reversed(words))  # on reprend dans l'ordre naturel pour la fin
-    return " ".join(words[-max_words:]).strip()
+    return " ".join(reversed(words[-max_words:])).strip()
+
+
+def _generate_conclusion_summary(conclusion_clean: str, conclusion_raw: str, raw_text: str) -> str:
+    """Génère un résumé de conclusion avec fallback sur contenu général."""
+    summary = summarize(conclusion_clean or conclusion_raw) if (conclusion_clean or conclusion_raw) else ""
+    
+    if not summary:
+        fallback = _get_text_tail(raw_text, 200) or clean_extracted_text(raw_text) or raw_text
+        summary = summarize(fallback)
+    
+    return summary or "Conclusion non disponible."
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Pipeline PDF fracture (mots-clés + résumé local)")
-    ap.add_argument("--pdf", required=True, help="Chemin vers un PDF scientifique")
-    ap.add_argument("--db", default="db/papers.sqlite", help="Chemin SQLite")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Analyse PDF scientifique")
+    parser.add_argument("--pdf", required=True, help="Chemin vers le PDF")
+    parser.add_argument("--db", default="db/papers.sqlite", help="Chemin vers la BD SQLite")
+    args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
     raw_text = extract_text_from_pdf(pdf_path)
 
-    # ÉTAPE 1 : Extraction basée sur règles regex (rapide)
-    abstract_text, conclusion_text = extract_abstract_and_conclusion(raw_text)
-    
-    # ÉTAPE 2 : Fallback LLM si extraction insuffisante
-    # Seuils : abstract < 50 mots OU conclusion < 30 mots → fallback
-    MIN_ABSTRACT_WORDS = 50
-    MIN_CONCLUSION_WORDS = 30
-    
-    abstract_ok = abstract_text and len(abstract_text.split()) >= MIN_ABSTRACT_WORDS
-    conclusion_ok = conclusion_text and len(conclusion_text.split()) >= MIN_CONCLUSION_WORDS
-    
-    if not abstract_ok or not conclusion_ok:
-        print(f"⚠️  Extraction regex insuffisante (abstract: {len(abstract_text.split()) if abstract_text else 0} mots, conclusion: {len(conclusion_text.split()) if conclusion_text else 0} mots)")
-        print("🔄 Activation du fallback LLM (FLAN-T5)...")
-        
-        abs_llm, conc_llm = llm_extract_abstract_conclusion(raw_text)
-        
-        if not abstract_ok and abs_llm:
-            abstract_text = abs_llm
-            print(f"✓ Abstract extrait par LLM ({len(abs_llm.split())} mots)")
-        
-        if not conclusion_ok and conc_llm:
-            conclusion_text = conc_llm
-            print(f"✓ Conclusion extraite par LLM ({len(conc_llm.split())} mots)")
-    
-    # ÉTAPE 3 : Nettoyage des sections extraites
-    abstract_text_raw = abstract_text
-    conclusion_text_raw = conclusion_text
-
-    abstract_text = clean_extracted_text(abstract_text)
-    conclusion_text = clean_extracted_text(conclusion_text)
+    # Extraction et nettoyage des sections
+    abstract_raw, conclusion_raw = _extract_sections(raw_text)
+    abstract_clean = clean_extracted_text(abstract_raw)
+    conclusion_clean = clean_extracted_text(conclusion_raw)
     raw_text_clean = clean_extracted_text(raw_text)
-    
-    # ÉTAPE 4 : Classification par mots-clés médicaux
-    cls = classify_by_keywords(raw_text_clean)
 
-    # ÉTAPE 5 : Génération des résumés
-    # Si le nettoyage vide une section mais que la version brute existe, on résume la version brute
-    abstract_source = abstract_text if abstract_text else abstract_text_raw
-    fallback_conclusion = _fallback_tail(raw_text, max_words=200)
-    conclusion_source = (
-        conclusion_text
-        or conclusion_text_raw
-        or fallback_conclusion
-        or raw_text_clean
-        or raw_text
-    )
+    # Classification par mots-clés
+    classification = classify_by_keywords(raw_text_clean)
 
-    abstract_summary = summarize(abstract_source) if abstract_source else ""
-    conclusion_summary = summarize(conclusion_source) if conclusion_source else ""
-    if not conclusion_summary and conclusion_source:
-        conclusion_summary = conclusion_source
-    
-    # ÉTAPE 6 : Construction du résultat JSON
+    # Génération des résumés
+    abstract_summary = summarize(abstract_clean or abstract_raw) if (abstract_clean or abstract_raw) else ""
+    conclusion_summary = _generate_conclusion_summary(conclusion_clean, conclusion_raw, raw_text)
+
+    # Résultat JSON
     result = {
         "pdf": str(pdf_path),
-        "region": cls.region,
-        "region_score": cls.region_score,
-        "fracture_types": cls.fracture_types,
-        "locations": cls.locations,
+        "region": classification.region,
+        "region_score": classification.region_score,
+        "fracture_types": classification.fracture_types,
+        "locations": classification.locations,
         "abstract_summary": abstract_summary,
         "conclusion_summary": conclusion_summary,
     }
 
-    # ÉTAPE 7 : Insertion en base de données
+    # Sauvegarde en BD
     conn = get_conn(args.db)
     paper_id = insert_paper(conn, {
         "filename": pdf_path.name,
         "pdf_path": str(pdf_path),
         "raw_text": raw_text_clean,
-        "abstract_text": abstract_text,
-        "conclusion_text": conclusion_text,
-        "region": cls.region,
-        "region_score": cls.region_score,
-        "fracture_types": ",".join(cls.fracture_types),
-        "locations": ",".join(cls.locations),
+        "abstract_text": abstract_clean,
+        "conclusion_text": conclusion_clean,
+        "region": classification.region,
+        "region_score": classification.region_score,
+        "fracture_types": ",".join(classification.fracture_types),
+        "locations": ",".join(classification.locations),
         "abstract_summary": abstract_summary,
         "conclusion_summary": conclusion_summary,
     })

@@ -1,15 +1,7 @@
-"""
-Résumé intelligent du texte avec DistilBART.
+"""Résumé intelligent du texte avec DistilBART.
 
-Charge un modèle local de résumé (cache + LRU), nettoie les phrases
-non cliniques (stats, software, etc.), puis crée un résumé concentré.
-Pour les textes courts (< 60 mots), retourne le texte original.
-
-Corrections appliquées (clean++):
-- Nettoyage renforcé des artefacts bibliographiques (CrossRef, DOI, Open Access, etc.)
-- Troncature sûre avant résumé pour éviter les warnings de longueur (tokens > max)
-- Filtre de sécurité: si le résumé généré est trop court / non pertinent -> retourne "" (ou texte court)
-- Suppression du warning "clean_up_tokenization_spaces" via paramètre explicite
+Nettoie le texte et génère des résumés via DistilBART,
+avec support pour textes longs via division en chunks.
 """
 from __future__ import annotations
 from functools import lru_cache
@@ -19,220 +11,182 @@ from transformers import pipeline
 
 @lru_cache(maxsize=1)
 def _summarizer():
-    """
-    Modèle de résumé local (téléchargé une fois et en cache).
-    """
+    """Charge le modèle DistilBART en cache."""
     return pipeline(
         "summarization",
         model="sshleifer/distilbart-cnn-12-6",
-        clean_up_tokenization_spaces=True,  # évite FutureWarning
+        clean_up_tokenization_spaces=True,
     )
 
 
-def _clean_for_summary(text: str) -> str:
-    """
-    Supprime les phrases non cliniques ou méthodologiques
-    (logiciels, statistiques, outils, bibliographie, etc.).
-    """
-    blacklist = [
-        # Méta / outils
-        r"endnote",
-        r"software",
-        r"statistical analysis",
-        r"ibm",
-        r"spss",
-        r"database",
-        r"search strategy",
-        r"screened",
-        r"eligibility criteria",
-        r"data extraction",
+def _is_reference_section(text: str) -> bool:
+    """Détecte si le texte est une section de références."""
+    if not text:
+        return False
 
-        # Stats fréquentes
-        r"p\s*<\s*0\.\d+",
-        r"p\s*=\s*0\.\d+",
-
-        # Artefacts bibliographiques / édition
-        r"crossref",
-        r"doi\s*:",
-        r"https?://doi\.org/",
-        r"open access",
-        r"creativecommons",
-        r"license",
-        r"references",
-        r"publisher",
-        r"issn",
-        r"pmcid",
-        r"pmid",
+    lines = text.strip().split("\n")
+    
+    ref_patterns = [
+        r"\[\d+\]", r"\d{1,2}\.", r"\[PubMed\]",
+        r"\[CrossRef\]", r"doi:", r"https://doi\.org/",
     ]
 
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    kept = []
+    ref_count = sum(
+        1 for line in lines[:min(20, len(lines))]
+        if any(re.search(p, line, re.IGNORECASE) for p in ref_patterns)
+    )
 
-    for s in sentences:
-        s_clean = s.strip()
-        if not s_clean:
-            continue
-        s_low = s_clean.lower()
-        if any(re.search(b, s_low) for b in blacklist):
-            continue
-        kept.append(s_clean)
+    if len(lines) > 10 and ref_count > len(lines) * 0.6:
+        return True
 
-    return " ".join(kept).strip()
-
-
-def _truncate_for_model(text: str, tokenizer) -> str:
-    """
-    Tronque le texte pour ne pas dépasser la longueur maximale du modèle.
-    DistilBART supporte généralement 1024 tokens max (selon tokenizer.model_max_length).
-    On garde une marge de sécurité pour éviter warnings/erreurs.
-    """
-    if not text:
-        return ""
-
-    max_len = tokenizer.model_max_length or 1024
-
-    # marge de sécurité (réserve) pour éviter les warnings/erreurs
-    reserve = 64
-    target_len = max(128, min(max_len - reserve, max_len))
-
-    # Important: truncation=True garantit qu'on ne dépasse pas
-    encoded = tokenizer.encode(text, truncation=True, max_length=target_len)
-    return tokenizer.decode(encoded, skip_special_tokens=True)
+    author_count = len(re.findall(r"[A-Z]\.;\s*[A-Z]\.;", text))
+    return author_count > 5 and len(text.split()) > 100
 
 
 def clean_extracted_text(text: str) -> str:
-    """
-    Nettoie le texte brut extrait des sections Abstract et Conclusion.
-
-    - Normalise les espaces et sauts de ligne
-    - Supprime les URLs / DOI
-    - Supprime des lignes typiques d'édition / revue
-    - Supprime citations [1], [2], etc.
-    - Réduit le bruit de ponctuation / symboles
-    """
+    """Nettoie le texte extrait (supprime références, URLs, métadonnées)."""
     text = (text or "").strip()
-    if not text:
+    if not text or _is_reference_section(text):
         return ""
 
-    # Normalise les fins de ligne et les sauts multiples
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Supprime les URLs
+    # Supprime URLs et DOI
     text = re.sub(r"https?://[^\s]+", "", text)
     text = re.sub(r"www\.[^\s]+", "", text)
-
-    # Supprime DOI (plusieurs formes)
-    text = re.sub(r"https?://doi\.org/[^\s]+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bdoi:\s*[^\s]+", "", text, flags=re.IGNORECASE)
 
-    # Supprime quelques marqueurs très fréquents en bas de page / édition
+    # Supprime marqueurs de bruit
     footer_noise = [
-        r"(?i)crossref",
-        r"(?i)open\s+access",
-        r"(?i)creative\s+commons",
-        r"(?i)license",
-        r"(?i)pmcid",
-        r"(?i)pmid",
-        r"(?i)issn",
+        r"(?i)crossref", r"(?i)open\s+access", r"(?i)license",
+        r"(?i)pmcid", r"(?i)pmid", r"(?i)issn",
     ]
-    lines = []
-    for line in text.split("\n"):
-        if any(re.search(pat, line) for pat in footer_noise):
-            continue
-        lines.append(line)
-    text = "\n".join(lines)
+    text = "\n".join(
+        line for line in text.split("\n")
+        if not any(re.search(pat, line) for pat in footer_noise)
+    )
 
-    # Supprime les lignes de métadonnées de revue (ex: EFORT Open Reviews (2025) 10 316–326)
-    journal_patterns = [
-        r"(?i)efort\s+open\s+reviews",
-        r"(?i)trauma\s+efort",
-        r"(?i)open\s+reviews",
-    ]
-    page_year_pattern = r"\(\d{4}\).*\d"
-    cleaned_lines = []
-    for line in text.split("\n"):
-        if any(re.search(pat, line) for pat in journal_patterns):
-            continue
-        if re.search(page_year_pattern, line):
-            continue
-        cleaned_lines.append(line)
-    text = "\n".join(cleaned_lines)
-
-    # Supprime citations numérotées en brackets [1], [2], etc.
+    # Supprime références et métadonnées
     text = re.sub(r"\[\d+(?:,\s*\d+)*\]", "", text)
+    text = re.sub(r"\[(?:PubMed|CrossRef|PMC|Medline)\]", "", text, flags=re.IGNORECASE)
+    
+    ref_pattern = r"^[A-Z]\.[A-Z]?;.*(?:\d{4}|doi|Surg|Rev|J\.|Lancet)"
+    text = "\n".join(
+        line for line in text.split("\n")
+        if not re.match(ref_pattern, line, flags=re.IGNORECASE)
+    )
 
-    # Nettoie espaces multiples et tabulations
+    # Nettoie espaces
     text = re.sub(r"\t+", " ", text)
     text = re.sub(r" {2,}", " ", text)
-
-    # Supprime espaces superflus autour de la ponctuation
     text = re.sub(r"\s+([.!?,;:])", r"\1", text)
-
-    # Assure un espacement correct après la ponctuation
     text = re.sub(r"([.!?])\s*([A-Z])", r"\1 \2", text)
-
-    # Supprime symboles orphelins au début des lignes
     text = re.sub(r"^[\W\d_]+\s*", "", text, flags=re.MULTILINE)
 
-    # Nettoie les lignes vides
-    text = "\n".join(line.strip() for line in text.split("\n"))
-    text = "\n\n".join(block for block in text.split("\n\n") if block.strip())
-
+    text = "\n\n".join(
+        block for block in (line.strip() for line in text.split("\n"))
+        if block
+    )
     return text.strip()
 
 
-def summarize(text: str, max_length: int = 200, min_length: int = 150) -> str:
-    """
-    Génère un résumé propre et cliniquement pertinent.
+def _clean_for_summary(text: str) -> str:
+    """Supprime les phrases non cliniques."""
+    if _is_reference_section(text):
+        return ""
 
-    Stratégie:
-    1) Nettoyage (sections, liens, citations)
-    2) Nettoyage "clinique" (supprimer phrases méta/biblio)
-    3) Troncature sûre (évite tokens > max)
-    4) Résumé DistilBART
-    5) Garde-fou: si sortie trop courte / non pertinente -> "" (évite "CrossRef]")
-    """
+    blacklist = [
+        r"endnote", r"software", r"statistical analysis", r"ibm", r"spss",
+        r"database", r"search strategy", r"screened", r"p\s*[<|=]\s*0\.\d+",
+        r"crossref", r"doi\s*:", r"https?://doi\.org/", r"open access",
+        r"references", r"pmcid", r"pmid", r"issn",
+    ]
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [
+        s.strip() for s in sentences
+        if s.strip() and not any(re.search(b, s.lower()) for b in blacklist)
+    ]
+    return " ".join(kept).strip()
+
+
+def _split_into_chunks(text: str, tokenizer, max_tokens: int = 512) -> list[str]:
+    """Divise le texte en chunks respectant la limite de tokens."""
+    if not text:
+        return []
+
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) <= max_tokens:
+        return [text]
+
+    chunks = []
+    for i in range(0, len(token_ids), max_tokens):
+        chunk_ids = token_ids[i:i + max_tokens]
+        chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _summarize_chunk(text: str, summarizer, max_length: int = 150, min_length: int = 100) -> str:
+    """Résume un chunk individuel."""
+    if not text or len(text.split()) < 20 or _is_reference_section(text):
+        return ""
+
+    try:
+        out = summarizer(text, max_length=max_length, min_length=min_length, do_sample=False, truncation=True)
+        summary = (out[0].get("summary_text") or "").strip()
+
+        if len(summary.split()) < 5:
+            return ""
+        if re.search(r"(?i)\bcrossref\b|\bdoi\b|open\s+access|\[pubmed\]|\[crossref\]", summary):
+            return ""
+        if _is_reference_section(summary):
+            return ""
+        if len(re.findall(r"\d{4}", summary)) > 3:
+            return ""
+
+        return summary
+    except Exception:
+        return ""
+
+
+def summarize(text: str, max_length: int = 200, min_length: int = 150) -> str:
+    """Génère un résumé propre et pertinent."""
     text = (text or "").strip()
     if not text:
         return ""
 
-    # Nettoyage fort en amont (utile si tu passes raw text)
     text = clean_extracted_text(text)
-
-    # Nettoyage clinique/méthodologique + bibliographie
     text = _clean_for_summary(text)
 
-    # Si texte trop court, inutile de résumer (et évite hallucinations)
     if len(text.split()) < 60:
         return text
 
     summarizer = _summarizer()
+    max_tokens = max(300, (summarizer.tokenizer.model_max_length or 1024) - 64)
 
-    # Troncature sûre pour éviter warnings / erreurs de longueur
-    text = _truncate_for_model(text, summarizer.tokenizer)
+    chunks = _split_into_chunks(text, summarizer.tokenizer, max_tokens=max_tokens)
 
-    out = summarizer(
-        text,
-        max_length=max_length,
-        min_length=min_length,
-        do_sample=False,
-        truncation=True,  # sécurité supplémentaire côté pipeline
-    )
-    summary = (out[0].get("summary_text") or "").strip()
+    if len(chunks) == 1:
+        summary = _summarize_chunk(chunks[0], summarizer, max_length, min_length)
+        return summary if summary else text
 
-    # Garde-fou: éviter résumés absurdes type "CrossRef]"
-    # - trop court
-    # - ou contient uniquement des tokens de bibliographie
-    if len(summary.split()) < 5:
-        return ""
+    chunk_summaries = [
+        s for chunk in chunks
+        if (s := _summarize_chunk(chunk, summarizer, max_length=120, min_length=80))
+    ]
 
-    if re.search(r"(?i)\bcrossref\b|\bdoi\b|creativecommons|open\s+access", summary):
-        # Si le résumé n'est que du bruit bibliographique, on le rejette
-        # (tu peux aussi choisir de renvoyer un texte court alternatif)
-        return ""
+    if not chunk_summaries:
+        return text
 
-    return summary
+    combined = " ".join(chunk_summaries)
+    if len(combined.split()) > max_length:
+        final = _summarize_chunk(combined, summarizer, max_length, min_length)
+        return final if final else combined
+
+    return combined
 
 
 
@@ -246,161 +200,3 @@ def summarize(text: str, max_length: int = 200, min_length: int = 150) -> str:
 
 
 
-
-
-
-
-# """Résumé intelligent du texte avec DistilBART.
-
-# Charge un modèle local de résumé (cache + LRU), nettoie les phrases
-# non cliniques (stats, software, etc.), puis crée un résumé concentré.
-# Pour les textes courts (< 60 mots), retourne le texte original.
-# """
-# from __future__ import annotations
-# from functools import lru_cache
-# import re
-# from transformers import pipeline
-
-
-# @lru_cache(maxsize=1)
-# def _summarizer():
-#     """
-#     Modèle de résumé local (téléchargé une fois et en cache).
-#     """
-#     return pipeline(
-#         "summarization",
-#         model="sshleifer/distilbart-cnn-12-6"
-#     )
-
-
-# def _clean_for_summary(text: str) -> str:
-#     """
-#     Supprime les phrases non cliniques ou méthodologiques
-#     (logiciels, statistiques, outils, etc.).
-#     """
-#     blacklist = [
-#         r"endnote",
-#         r"software",
-#         r"statistical analysis",
-#         r"p\s*<\s*0\.\d+",
-#         r"ibm",
-#         r"spss",
-#     ]
-
-#     sentences = re.split(r"(?<=[.!?])\s+", text)
-#     kept = []
-
-#     for s in sentences:
-#         s_low = s.lower()
-#         if any(re.search(b, s_low) for b in blacklist):
-#             continue
-#         kept.append(s)
-
-#     return " ".join(kept).strip()
-
-
-# def _truncate_for_model(text: str, tokenizer) -> str:
-#     """
-#     Tronque le texte pour ne pas dépasser la longueur maximale du modèle (BART ~1024 tokens).
-#     """
-#     if not text:
-#         return ""
-#     max_len = tokenizer.model_max_length or 1024
-#     # On garde une marge de sécurité de 16 tokens
-#     target_len = max(64, min(max_len - 16, 1024))
-#     encoded = tokenizer.encode(text, truncation=True, max_length=target_len)
-#     return tokenizer.decode(encoded, skip_special_tokens=True)
-
-
-# def clean_extracted_text(text: str) -> str:
-#     """
-#     Nettoie le texte brut extrait des sections Abstract et Conclusion.
-    
-#     - Normalise les espaces et sauts de ligne
-#     - Supprime les espaces supplémentaires et tabulations
-#     - Supprime les URLs et références en brackets
-#     - Élimine les nombres orphelins et symboles
-#     - Assure un espacement correct entre les phrases
-#     """
-#     text = (text or "").strip()
-#     if not text:
-#         return ""
-    
-#     # Normalise les fins de ligne et les sauts multiples
-#     text = text.replace("\r\n", "\n")
-#     text = text.replace("\r", "\n")
-#     text = re.sub(r"\n{3,}", "\n\n", text)
-    
-#     # Supprime les URLs
-#     text = re.sub(r"https?://[^\s]+", "", text)
-#     text = re.sub(r"www\.[^\s]+", "", text)
-    
-#     # Supprime les références DOI
-#     text = re.sub(r"https://doi\.org/[^\s]+", "", text)
-#     text = re.sub(r"doi:\s*[^\s]+", "", text)
-
-#     # Supprime les lignes de métadonnées de revue (ex: EFORT Open Reviews (2025) 10 316–326)
-#     journal_patterns = [
-#         r"(?i)efort\s+open\s+reviews",
-#         r"(?i)open\s+reviews",
-#         r"(?i)trauma\s+efort",
-#     ]
-#     page_year_pattern = r"\(\d{4}\).*\d"
-#     cleaned_lines = []
-#     for line in text.split("\n"):
-#         if any(re.search(pat, line) for pat in journal_patterns):
-#             cleaned_lines.append("")
-#             continue
-#         if re.search(page_year_pattern, line):
-#             # lignes typiques de citations avec année + pagination
-#             cleaned_lines.append("")
-#             continue
-#         cleaned_lines.append(line)
-#     text = "\n".join(l for l in cleaned_lines if l.strip())
-    
-#     # Supprime les citations numérotées en brackets [1], [2], etc.
-#     text = re.sub(r"\[\d+(?:,\s*\d+)*\]", "", text)
-    
-#     # Nettoie les espaces multiples et tabulations
-#     text = re.sub(r"\t+", " ", text)
-#     text = re.sub(r" {2,}", " ", text)
-    
-#     # Supprime les espaces superflus autour de la ponctuation
-#     text = re.sub(r"\s+([.!?,;:])", r"\1", text)
-    
-#     # Assure un espacement correct après la ponctuation
-#     text = re.sub(r"([.!?])\s*([A-Z])", r"\1 \2", text)
-    
-#     # Supprime les symboles orphelins au début des lignes
-#     text = re.sub(r"^[\W\d_]+\s*", "", text, flags=re.MULTILINE)
-    
-#     # Nettoie les espaces en début/fin de ligne
-#     text = "\n".join(line.strip() for line in text.split("\n"))
-#     text = "\n\n".join(line for line in text.split("\n\n") if line.strip())
-    
-#     return text.strip()
-
-
-# def summarize(text: str, max_length: int = 200, min_length: int = 150) -> str:
-#     """
-#     Génère un résumé propre et cliniquement pertinent.
-#     """
-#     text = (text or "").strip()
-#     if not text:
-#         return ""
-
-#     text = _clean_for_summary(text)
-
-#     if len(text.split()) < 60:
-#         return text
-
-#     summarizer = _summarizer()
-    
-#     text = _truncate_for_model(text, summarizer.tokenizer)
-#     out = summarizer(
-#         text,
-#         max_length=max_length,
-#         min_length=min_length,
-#         do_sample=False
-#     )
-#     return out[0]["summary_text"].strip()
